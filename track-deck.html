@@ -1,0 +1,1039 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="TRACK DECK">
+<meta name="theme-color" content="#0D1113">
+<title>四辻 TRACK DECK</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2220%22 fill=%22%230D1113%22/><text y=%2270%22 x=%2250%22 text-anchor=%22middle%22 font-size=%2255%22 fill=%22%237FB8AD%22 font-family=%22monospace%22>四</text></svg>">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>html,body{margin:0;padding:0;background:#0D1113;-webkit-text-size-adjust:100%}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useEffect } = React;
+
+// ---- Camelot key logic ----
+const MAJOR_CAMELOT = ["8B","3B","10B","5B","12B","7B","2B","9B","4B","11B","6B","1B"];
+const MINOR_CAMELOT = ["5A","12A","7A","2A","9A","4A","11A","6A","1A","8A","3A","10A"];
+const NOTE_TO_PC = { "C":0,"C#":1,"DB":1,"D":2,"D#":3,"EB":3,"E":4,"F":5,"F#":6,"GB":6,"G":7,"G#":8,"AB":8,"A":9,"A#":10,"BB":10,"B":11,"CB":11 };
+
+function toCamelot(rawKey, rawMode) {
+  if (rawKey == null || rawKey === "") return null;
+  const s = String(rawKey).trim().toUpperCase();
+  const cm = s.match(/^(\d{1,2})\s*([AB])$/);
+  if (cm) { const n = +cm[1]; if (n >= 1 && n <= 12) return n + cm[2]; }
+  if (/^-?\d+$/.test(s)) {
+    const pc = +s;
+    if (pc < 0 || pc > 11) return null;
+    const isMinor = rawMode != null ? (+rawMode === 0) : true;
+    return isMinor ? MINOR_CAMELOT[pc] : MAJOR_CAMELOT[pc];
+  }
+  const tm = s.match(/^([A-G][#B]?)\s*(M(?![AI])|MIN(?:OR)?|MAJ(?:OR)?)?$/);
+  if (tm) {
+    const pc = NOTE_TO_PC[tm[1]];
+    if (pc == null) return null;
+    const q = tm[2] || "";
+    const isMinor = q.startsWith("MIN") || q === "M";
+    return isMinor ? MINOR_CAMELOT[pc] : MAJOR_CAMELOT[pc];
+  }
+  return null;
+}
+
+function parseKey(k) { return { num: parseInt(k, 10), mode: k.slice(-1) }; }
+
+function keyRelation(from, to) {
+  const a = parseKey(from), b = parseKey(to);
+  const diff = ((b.num - a.num) + 12) % 12;
+  if (a.mode === b.mode) {
+    if (diff === 0) return { score: 3, label: "同キー" };
+    if (diff === 1) return { score: 3, label: "+1 上行" };
+    if (diff === 11) return { score: 3, label: "-1 下行" };
+    if (diff === 2) return { score: 1, label: "+2 ブースト" };
+  } else {
+    if (diff === 0) return { score: 3, label: "平行調" };
+    if (a.mode === "A" && diff === 1) return { score: 1, label: "対角" };
+  }
+  return { score: 0, label: "不一致" };
+}
+
+function bpmScore(from, to) {
+  const diff = Math.abs(to - from) / from;
+  if (diff <= 0.03) return { score: 3, pct: diff };
+  if (diff <= 0.06) return { score: 2, pct: diff };
+  if (diff <= 0.10) return { score: 1, pct: diff };
+  return { score: 0, pct: diff };
+}
+
+// ---- Spotify link ----
+function toSpotifyUrl(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const m = s.match(/spotify:track:([A-Za-z0-9]+)/);
+  if (m) return "https://open.spotify.com/track/" + m[1];
+  if (s.startsWith("https://open.spotify.com/")) return s.split("?")[0];
+  return null;
+}
+
+// ---- CSV column auto-detection ----
+const COL_GUESS = {
+  title:  ["track name","name","title","track","song","曲名"],
+  artist: ["artist name(s)","artist name","artists","artist","アーティスト"],
+  bpm:    ["tempo","bpm"],
+  key:    ["key","camelot","initial key","キー"],
+  mode:   ["mode"],
+  energy: ["energy"],
+  genre:  ["artist genres","genres","genre","ジャンル"],
+  label:  ["record label","label","レーベル","publisher"],
+  year:   ["release date","album release date","year","released","リリース"],
+  url:    ["track uri","spotify uri","spotify url","track url","uri","url","link"],
+};
+
+function guessColumns(headers) {
+  const lower = headers.map(h => h.toLowerCase().trim());
+  const pick = (cands) => {
+    for (const c of cands) { const i = lower.indexOf(c); if (i >= 0) return headers[i]; }
+    for (const c of cands) { const i = lower.findIndex(h => h.includes(c)); if (i >= 0) return headers[i]; }
+    return "";
+  };
+  const out = {};
+  for (const [field, cands] of Object.entries(COL_GUESS)) out[field] = pick(cands);
+  return out;
+}
+
+// ---- Tagging ----
+const PRESET_TAGS = ["ピークタイム","つなぎ","イントロ長め","フロア検証済","オープナー","クローザー"];
+const trackKey = t => (t.artist + "␟" + t.title).toLowerCase();
+
+// ---- Demo library ----
+const SEED = [
+  ["Rings Around Saturn","Deepchord",122,"5A",2,"dub techno"],["Minus","Rod Modell",118,"5A",2,"dub techno"],
+  ["Phylyps Trak II","Basic Channel",126,"6A",3,"dub techno, minimal"],["Aquadrive","Maurizio",128,"7A",4,"dub techno"],
+  ["Zug Island","Echospace",120,"4A",2,"dub techno, ambient techno"],["Sea of Clouds","Yagya",118,"12A",1,"ambient techno"],
+  ["Ghost Frequency","Fluxion",124,"6A",3,"dub techno"],["Systemic","Monolake",126,"8A",3,"minimal, idm"],
+  ["Immersion","Deadbeat",120,"5B",2,"dub techno, dub"],["Reverse Rotation","Function",130,"7A",5,"techno"],
+  ["Spastik","Plastikman",132,"8A",5,"techno, minimal"],["Departure","Wata Igarashi",128,"9A",4,"techno, trance"],
+];
+const DEMO = SEED.map((t,i)=>({ id:i, title:t[0], artist:t[1], bpm:t[2], key:t[3], energy:t[4], genre:t[5], year:[2011,2007,1994,1997,2007,2009,2004,2001,2011,2013,1993,2018][i] ?? null, label:["Modern Love","Plop","Basic Channel","M","echospace [detroit]","Sending Orbs","Chain Reaction","Imbalance Computer Music","BLKRTZ","Ostgut Ton","NovaMute","Midgar"][i] ?? "", url:null }));
+
+// ---- UI atoms ----
+function EnergyBars({ level }) {
+  if (!level) return <span style={{ color:"#3A464B", fontSize:11 }}>—</span>;
+  return (
+    <span style={{ display:"inline-flex", gap:2, alignItems:"flex-end" }}>
+      {[1,2,3,4,5].map(i => (
+        <span key={i} style={{ width:3, height:3+i*2, borderRadius:1,
+          background: i<=level ? "#E0A458" : "#2A3438" }} />
+      ))}
+    </span>
+  );
+}
+
+function KeyChip({ k }) {
+  if (!k) return <span style={{ color:"#3A464B", fontSize:11 }}>—</span>;
+  const isA = k.endsWith("A");
+  return (
+    <span style={{ fontFamily:"'IBM Plex Mono', monospace", fontSize:11, padding:"2px 7px",
+      borderRadius:3, letterSpacing:0.5, whiteSpace:"nowrap",
+      background:isA?"rgba(127,184,173,0.14)":"rgba(148,166,196,0.14)",
+      color:isA?"#7FB8AD":"#94A6C4",
+      border:`1px solid ${isA?"rgba(127,184,173,0.3)":"rgba(148,166,196,0.3)"}` }}>{k}</span>
+  );
+}
+
+function SpotifyBtn({ url, size = 26 }) {
+  if (!url) return null;
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer"
+      onClick={e => e.stopPropagation()}
+      style={{ display:"inline-flex", alignItems:"center", justifyContent:"center",
+        width:size, height:size, borderRadius:"50%", flexShrink:0,
+        background:"rgba(30,215,96,0.12)", border:"1px solid rgba(30,215,96,0.35)",
+        color:"#1ED760", fontSize:size*0.42, textDecoration:"none" }}>
+      ▶
+    </a>
+  );
+}
+
+function SpotifyEmbed({ url }) {
+  if (!url) return null;
+  const m = url.match(/track\/([A-Za-z0-9]+)/);
+  if (!m) return null;
+  return (
+    <iframe
+      src={"https://open.spotify.com/embed/track/" + m[1] + "?theme=0"}
+      width="100%" height="80" frameBorder="0"
+      allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+      loading="lazy"
+      style={{ borderRadius:8, marginTop:10, display:"block", border:"none" }}
+      title="Spotify player" />
+  );
+}
+
+const S = {
+  panel: { background:"#141A1D", border:"1px solid #222B2F", borderRadius:8 },
+  mono: { fontFamily:"'IBM Plex Mono', monospace" },
+  label: { fontFamily:"'IBM Plex Mono', monospace", fontSize:10, letterSpacing:2, color:"#5C6B70", textTransform:"uppercase" },
+  // iOS Safariは入力欄のフォントが16px未満だと自動ズームするため、必ず16px
+  input: { background:"#0D1113", border:"1px solid #2A3438", borderRadius:6, padding:"9px 10px", color:"#DCE4E2", fontSize:16, fontFamily:"inherit" },
+};
+
+const RENDER_LIMIT = 150;
+
+const SORT_OPTIONS = [
+  ["", "並び替えなし"],
+  ["bpm:1", "BPM 低→高"], ["bpm:-1", "BPM 高→低"],
+  ["key:1", "KEY 1A→12B"], ["key:-1", "KEY 12B→1A"],
+  ["energy:1", "Energy 低→高"], ["energy:-1", "Energy 高→低"],
+  ["year:-1", "年 新→古"], ["year:1", "年 古→新"],
+  ["title:1", "曲名 A→Z"],
+];
+
+function TrackDeck() {
+  const [lib, setLib] = useState(() => { try { const s = localStorage.getItem("td_lib"); if (s) { const p = JSON.parse(s); if (Array.isArray(p) && p.length) return p; } } catch {} return DEMO; });
+  const [source, setSource] = useState(() => { try { return localStorage.getItem("td_src") || "demo"; } catch { return "demo"; } });
+  const [importStats, setImportStats] = useState(null);
+  const [mappingState, setMappingState] = useState(null);
+  const fileRef = useRef(null);
+  const tagFileRef = useRef(null);
+
+  const [q, setQ] = useState("");
+  const [bpmMin, setBpmMin] = useState("");
+  const [bpmMax, setBpmMax] = useState("");
+  const [keyFilter, setKeyFilter] = useState("");
+  const [genreFilter, setGenreFilter] = useState("");
+  const [decadeFilter, setDecadeFilter] = useState("");
+  const [activeTags, setActiveTags] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [setList, setSetList] = useState(() => { try { return JSON.parse(localStorage.getItem("td_set") || "[]"); } catch { return []; } });
+  const [sortKey, setSortKey] = useState("");
+  const [showFilters, setShowFilters] = useState(false);
+  const [playlistName, setPlaylistName] = useState("");
+  const [exportState, setExportState] = useState(null); // null | "loading" | {ok, msg}
+  const [sugMode, setSugMode] = useState("smooth"); // smooth | shift | bpm | energy
+  const [shuffleTick, setShuffleTick] = useState(0);
+
+  // mobile detection + tabs
+  const [isMobile, setIsMobile] = useState(false);
+  const [tab, setTab] = useState("lib"); // lib | next | set
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 700px)");
+    const upd = () => setIsMobile(mq.matches);
+    upd();
+    mq.addEventListener("change", upd);
+    return () => mq.removeEventListener("change", upd);
+  }, []);
+
+  // ---- localStorage persistence ----
+  useEffect(() => { try { localStorage.setItem("td_tags", JSON.stringify(tagMap)); } catch {} }, [tagMap]);
+  useEffect(() => { try { localStorage.setItem("td_ctags", JSON.stringify(customTags)); } catch {} }, [customTags]);
+  useEffect(() => { try { localStorage.setItem("td_set", JSON.stringify(setList)); } catch {} }, [setList]);
+  useEffect(() => {
+    if (source !== "csv") return;
+    try {
+      localStorage.setItem("td_lib", JSON.stringify(lib));
+      localStorage.setItem("td_src", "csv");
+    } catch (e) { console.warn("ライブラリの保存に失敗(容量超過の可能性)", e); }
+  }, [lib, source]);
+
+  const resetAll = () => {
+    if (window.confirm("保存データ(ライブラリ・タグ・セット)を全て削除して初期状態に戻しますか?")) {
+      try { localStorage.removeItem("td_lib"); localStorage.removeItem("td_src"); localStorage.removeItem("td_tags"); localStorage.removeItem("td_ctags"); localStorage.removeItem("td_set"); } catch {}
+      location.reload();
+    }
+  };
+
+  const [tagMap, setTagMap] = useState(() => { try { return JSON.parse(localStorage.getItem("td_tags") || "{}"); } catch { return {}; } });
+  const [customTags, setCustomTags] = useState(() => { try { return JSON.parse(localStorage.getItem("td_ctags") || "[]"); } catch { return []; } });
+  const [newTag, setNewTag] = useState("");
+
+  const getTags = (t) => tagMap[trackKey(t)] || [];
+  const allTags = useMemo(() => {
+    const s = new Set([...PRESET_TAGS, ...customTags]);
+    Object.values(tagMap).forEach(arr => arr.forEach(x => s.add(x)));
+    return [...s];
+  }, [customTags, tagMap]);
+
+  const toggleTrackTag = (t, tag) => {
+    const k = trackKey(t);
+    setTagMap(m => {
+      const cur = m[k] || [];
+      const next = cur.includes(tag) ? cur.filter(x => x !== tag) : [...cur, tag];
+      const out = { ...m };
+      if (next.length) out[k] = next; else delete out[k];
+      return out;
+    });
+  };
+
+  const addCustomTag = () => {
+    const t = newTag.trim();
+    if (!t || allTags.includes(t)) { setNewTag(""); return; }
+    setCustomTags(p => [...p, t]);
+    if (selected) toggleTrackTag(selected, t);
+    setNewTag("");
+  };
+
+  const exportTags = () => {
+    const blob = new Blob([JSON.stringify({ version: 1, tags: tagMap }, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "yotsuji-tags.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const importTags = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (data && typeof data.tags === "object") {
+          setTagMap(m => ({ ...m, ...data.tags }));
+          const imported = new Set();
+          Object.values(data.tags).forEach(arr => arr.forEach(x => imported.add(x)));
+          setCustomTags(p => [...new Set([...p, ...imported])].filter(x => !PRESET_TAGS.includes(x)));
+        }
+      } catch { /* ignore invalid JSON */ }
+    };
+    reader.readAsText(file);
+  };
+
+  const onFile = (file) => {
+    Papa.parse(file, {
+      header: true, skipEmptyLines: true,
+      complete: (res) => {
+        const headers = res.meta.fields || [];
+        setMappingState({ headers, rows: res.data, map: guessColumns(headers) });
+      },
+      error: () => setImportStats({ error: "CSVの読み込みに失敗しました。" }),
+    });
+  };
+
+  const runImport = () => {
+    const { rows, map } = mappingState;
+    let noKey = 0, noBpm = 0;
+    const tracks = rows.map((r, i) => {
+      const bpm = map.bpm ? Math.round(parseFloat(r[map.bpm])) || null : null;
+      const key = map.key ? toCamelot(r[map.key], map.mode ? r[map.mode] : null) : null;
+      let energy = null;
+      if (map.energy) {
+        const e = parseFloat(r[map.energy]);
+        if (!isNaN(e)) energy = e <= 1 ? Math.round(e * 4) + 1 : Math.min(5, Math.round(e));
+      }
+      if (!key) noKey++;
+      if (!bpm) noBpm++;
+      let year = null;
+      if (map.year) {
+        const ym = String(r[map.year] || "").match(/\d{4}/);
+        if (ym) year = +ym[0];
+      }
+      return {
+        id: i,
+        title: map.title ? (r[map.title] || "(不明)") : "(不明)",
+        artist: map.artist ? (r[map.artist] || "") : "",
+        bpm, key, energy, year,
+        genre: map.genre ? (r[map.genre] || "") : "",
+        label: map.label ? (r[map.label] || "") : "",
+        url: map.url ? toSpotifyUrl(r[map.url]) : null,
+      };
+    }).filter(t => t.title !== "(不明)" || t.artist);
+
+    setLib(tracks);
+    setSource("csv");
+    setSelected(null);
+    setSetList([]);
+    setImportStats({ total: tracks.length, noKey, noBpm });
+    setMappingState(null);
+    setBpmMin(""); setBpmMax(""); setGenreFilter("");
+  };
+
+  const genres = useMemo(() => {
+    const count = {};
+    lib.forEach(t => {
+      if (!t.genre) return;
+      String(t.genre).split(",").map(g => g.trim().toLowerCase()).filter(Boolean)
+        .forEach(g => { count[g] = (count[g] || 0) + 1; });
+    });
+    return Object.entries(count).sort((a, b) => b[1] - a[1]);
+  }, [lib]);
+
+  const decades = useMemo(() => {
+    const s = new Set(lib.map(t => t.year).filter(Boolean).map(y => Math.floor(y / 10) * 10));
+    return [...s].sort((a, b) => b - a);
+  }, [lib]);
+
+  const bpmLo = parseFloat(bpmMin), bpmHi = parseFloat(bpmMax);
+  const filtered = useMemo(() => lib.filter(t => {
+    if (t.bpm) {
+      if (!isNaN(bpmLo) && t.bpm < bpmLo) return false;
+      if (!isNaN(bpmHi) && t.bpm > bpmHi) return false;
+    }
+    if (keyFilter && t.key !== keyFilter) return false;
+    if (decadeFilter) {
+      if (!t.year || Math.floor(t.year / 10) * 10 !== +decadeFilter) return false;
+    }
+    if (genreFilter) {
+      const gs = String(t.genre || "").split(",").map(g => g.trim().toLowerCase());
+      if (!gs.includes(genreFilter)) return false;
+    }
+    if (activeTags.length) {
+      const tt = getTags(t);
+      if (!activeTags.every(tag => tt.includes(tag))) return false;
+    }
+    if (q) {
+      const s = (t.title + " " + t.artist + " " + t.genre + " " + (t.label || "")).toLowerCase();
+      if (!s.includes(q.toLowerCase())) return false;
+    }
+    return true;
+  }), [lib, q, bpmLo, bpmHi, keyFilter, genreFilter, decadeFilter, activeTags, tagMap]);
+
+  const sorted = useMemo(() => {
+    if (!sortKey) return filtered;
+    const [col, dirS] = sortKey.split(":");
+    const dir = +dirS;
+    const val = t => {
+      if (col === "title") return (t.title || "").toLowerCase();
+      if (col === "bpm") return t.bpm ?? null;
+      if (col === "key") return t.key ? parseInt(t.key) * 2 + (t.key.endsWith("B") ? 1 : 0) : null;
+      if (col === "energy") return t.energy ?? null;
+      if (col === "year") return t.year ?? null;
+      return null;
+    };
+    return [...filtered].sort((a, b) => {
+      const va = val(a), vb = val(b);
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      return (va < vb ? -1 : va > vb ? 1 : 0) * dir;
+    });
+  }, [filtered, sortKey]);
+
+  const gTokens = (t) => new Set(String(t.genre || "").split(",").map(g => g.trim().toLowerCase()).filter(Boolean));
+
+  const suggestions = useMemo(() => {
+    if (!selected || !selected.key || !selected.bpm) return [];
+    const selG = gTokens(selected);
+    const inSet = new Set(setList.map(x => x.id));
+    const cands = [];
+    for (const t of lib) {
+      if (t.id === selected.id || inSet.has(t.id)) continue;
+      if (!t.key || !t.bpm) continue;
+      const kr = keyRelation(selected.key, t.key);
+      const br = bpmScore(selected.bpm, t.bpm);
+      if (Math.abs(t.bpm - selected.bpm) > 5) continue; // 全モード共通: BPM振り幅は±5以内
+      const eDelta = (t.energy && selected.energy) ? t.energy - selected.energy : 0;
+      const tg = gTokens(t);
+      let ov = 0; selG.forEach(g => { if (tg.has(g)) ov++; });
+      let score = null;
+      if (sugMode === "smooth") {
+        // 同系統: キー互換 × 近BPM × ジャンル共通 × エナジー変化小
+        if (kr.score === 0 || br.score === 0) continue;
+        score = kr.score * 2 + br.score + Math.min(ov, 3) * 1.5 - Math.abs(eDelta);
+      } else if (sugMode === "genre") {
+        // 同じジャンル: ジャンルが1つ以上重なる曲に限定
+        if (ov === 0) continue;
+        score = ov * 2 + kr.score + br.score - Math.abs(eDelta) * 0.5;
+      } else if (sugMode === "shift") {
+        // 雰囲気を変える: ジャンルが被らない曲を優先、エナジー変化は歓迎
+        if (selG.size && tg.size && ov > 0) continue;
+        score = kr.score + br.score + Math.abs(eDelta) * 1.5 + (kr.score > 0 ? 1 : 0);
+      } else if (sugMode === "bpm") {
+        // BPM維持: ±2以内をさらに厳守、キーは合えばボーナス(不一致でも候補に残す)
+        if (Math.abs(t.bpm - selected.bpm) > 2) continue;
+        score = (2 - Math.abs(t.bpm - selected.bpm)) * 2 + kr.score;
+      } else if (sugMode === "energy") {
+        // 上げる: エナジー+1以上、キー・BPMはつながる範囲
+        if (!t.energy || !selected.energy) continue;
+        if (eDelta < 1) continue;
+        if (kr.score === 0 || br.score === 0) continue;
+        score = eDelta * 2 + kr.score + br.score;
+      } else if (sugMode === "era") {
+        // 同年代: 同じ年代(10年区切り)の曲に限定、年が近くキーが合うほど上位
+        if (!t.year || !selected.year) continue;
+        if (Math.floor(t.year / 10) !== Math.floor(selected.year / 10)) continue;
+        score = kr.score * 1.5 + br.score + (5 - Math.min(5, Math.abs(t.year - selected.year))) * 0.4;
+      } else if (sugMode === "down") {
+        // 下げる: エナジー-1以下、キー・BPMはつながる範囲
+        if (!t.energy || !selected.energy) continue;
+        if (eDelta > -1) continue;
+        if (kr.score === 0 || br.score === 0) continue;
+        score = (-eDelta) * 2 + kr.score + br.score;
+      }
+      if (score == null) continue;
+      cands.push({ t, kr, br, eDelta, score });
+    }
+    cands.sort((a, b) => b.score - a.score);
+    // 上位80曲プールから重み付きシャッフルで選出(毎回顔ぶれが変わる)
+    const pool = cands.slice(0, 80).map(s => ({ ...s, j: s.score + Math.random() * 2.5 }));
+    pool.sort((a, b) => b.j - a.j);
+    const picked = [];
+    const artistCount = {};
+    for (const s of pool) {
+      const a = (s.t.artist || "").toLowerCase();
+      if ((artistCount[a] || 0) >= 3) continue;
+      picked.push(s);
+      artistCount[a] = (artistCount[a] || 0) + 1;
+      if (picked.length >= 30) break;
+    }
+    return picked;
+  }, [selected, lib, sugMode, shuffleTick, setList]);
+
+  const addToSet = (t) => setSetList(p => p.some(x => x.id === t.id) ? p : [...p, t]);
+  const removeFromSet = (id) => setSetList(p => p.filter(x => x.id !== id));
+  const moveInSet = (i, delta) => setSetList(p => {
+    const j = i + delta;
+    if (j < 0 || j >= p.length) return p;
+    const c = [...p];
+    [c[i], c[j]] = [c[j], c[i]];
+    return c;
+  });
+
+  // ---- Spotify playlist export ----
+  const setUris = () => setList
+    .filter(t => t.url)
+    .map(t => {
+      const m = t.url.match(/track\/([A-Za-z0-9]+)/);
+      return m ? "spotify:track:" + m[1] : null;
+    })
+    .filter(Boolean);
+
+  const copyUris = async () => {
+    const uris = setUris();
+    if (!uris.length) { setExportState({ ok: false, msg: "Spotifyリンクを持つ曲がセットにありません。" }); return; }
+    try {
+      await navigator.clipboard.writeText(uris.join("\n"));
+      setExportState({ ok: true, msg: `${uris.length}曲のURIをコピーしました。SpotifyデスクトップアプリのプレイリストにCtrl+V / Cmd+Vで貼り付けられます。` });
+    } catch {
+      setExportState({ ok: false, msg: "コピーに失敗しました。" });
+    }
+  };
+
+  const copyForImport = async () => {
+    const lines = setList.map(t => `${t.artist} - ${t.title}`);
+    if (!lines.length) return;
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setExportState({ ok: true, msg: `${lines.length}曲をコピーしました。TuneMyMusicの「テキストから」に貼り付けてください(1行=1曲の「アーティスト - 曲名」形式)。` });
+    } catch {
+      setExportState({ ok: false, msg: "コピーに失敗しました。" });
+    }
+  };
+
+  const copyTrackLinks = async () => {
+    const links = setList.filter(t => t.url).map(t => t.url);
+    if (!links.length) { setExportState({ ok: false, msg: "Spotifyリンクを持つ曲がセットにありません。" }); return; }
+    const skipped = setList.length - links.length;
+    try {
+      await navigator.clipboard.writeText(links.join("\n"));
+      setExportState({ ok: true, msg: `${links.length}曲のリンクをコピーしました${skipped ? `(リンクなし${skipped}曲はスキップ)` : ""}。TuneMyMusicまたはSoundiizの「テキストから取込」に貼り付けると、この曲順のままSpotifyプレイリストが作成できます。` });
+    } catch {
+      setExportState({ ok: false, msg: "コピーに失敗しました。" });
+    }
+  };
+
+  const copyTextList = async () => {
+    const name = playlistName.trim() || `四辻 set ${new Date().toISOString().slice(0, 10)}`;
+    const lines = setList.map((t, i) => `${String(i + 1).padStart(2, "0")}. ${t.artist} - ${t.title}${t.bpm ? ` [${t.bpm}${t.key ? " " + t.key : ""}]` : ""}`);
+    try {
+      await navigator.clipboard.writeText(`${name}\n${"-".repeat(24)}\n` + lines.join("\n"));
+      setExportState({ ok: true, msg: "トラックリスト(テキスト)をコピーしました。" });
+    } catch {
+      setExportState({ ok: false, msg: "コピーに失敗しました。" });
+    }
+  };
+
+  const selectTrack = (t) => {
+    setSelected(t);
+    if (isMobile) setTab("next");
+  };
+
+  const transition = (a, b) => {
+    if (!a.key || !b.key || !a.bpm || !b.bpm) return { c:"#5C6B70", txt:"? データ不足" };
+    const kr = keyRelation(a.key, b.key);
+    const br = bpmScore(a.bpm, b.bpm);
+    if (kr.score >= 3 && br.score >= 2) return { c:"#7FB8AD", txt:"◎ " + kr.label };
+    if (kr.score >= 1 && br.score >= 1) return { c:"#E0A458", txt:"○ " + kr.label };
+    return { c:"#C4675C", txt:"△ 要調整" };
+  };
+
+  const usedKeys = useMemo(() => {
+    const s = new Set(lib.map(t => t.key).filter(Boolean));
+    return [...s].sort((a,b) => parseInt(a) - parseInt(b) || a.localeCompare(b));
+  }, [lib]);
+
+  const taggedCount = Object.keys(tagMap).length;
+  const shown = sorted.slice(0, RENDER_LIMIT);
+  const activeFilterCount = [genreFilter, keyFilter, decadeFilter, bpmMin, bpmMax].filter(Boolean).length + activeTags.length;
+
+  // ---- Sub-views ----
+  const TrackRow = ({ t }) => {
+    const sel = selected?.id === t.id;
+    const tt = getTags(t);
+    return (
+      <div onClick={() => selectTrack(t)} style={{
+        display:"flex", alignItems:"center", gap:10, padding:"10px 12px",
+        borderBottom:"1px solid #1A2226", cursor:"pointer",
+        background: sel ? "rgba(127,184,173,0.08)" : "transparent",
+        borderLeft: sel ? "3px solid #7FB8AD" : "3px solid transparent" }}>
+        <div style={{ flex:1, minWidth:0 }}>
+          <div style={{ fontWeight:500, fontSize:14, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{t.title}</div>
+          <div style={{ fontSize:11, color:"#6E7E84", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+            {t.artist}{t.year ? <span style={{ ...S.mono, color:"#5C6B70" }}> · {t.year}</span> : null}{t.label ? <span style={{ color:"#5C6B70" }}> · {t.label}</span> : null}
+          </div>
+          {tt.length > 0 && (
+            <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:3 }}>
+              {tt.map(tag => (
+                <span key={tag} style={{ fontSize:9, color:"#E0A458",
+                  background:"rgba(224,164,88,0.1)", padding:"1px 6px", borderRadius:3 }}>{tag}</span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3, flexShrink:0 }}>
+          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            <span style={{ ...S.mono, fontSize:12, color:"#B8C4C2" }}>{t.bpm ?? "—"}</span>
+            <KeyChip k={t.key} />
+          </div>
+          <EnergyBars level={t.energy} />
+        </div>
+        <SpotifyBtn url={t.url} />
+      </div>
+    );
+  };
+
+  const LibraryView = (
+    <div>
+      <div style={{ ...S.panel, padding:12, marginBottom:12 }}>
+        <div style={{ display:"flex", gap:8 }}>
+          <input value={q} onChange={e => setQ(e.target.value)}
+            placeholder="検索" style={{ ...S.input, flex:1, minWidth:0 }} />
+          <select value={sortKey} onChange={e => setSortKey(e.target.value)}
+            style={{ flex:"0 1 150px" }}>
+            {SORT_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+          {isMobile && (
+            <button onClick={() => setShowFilters(v => !v)} style={{
+              padding:"0 14px", borderRadius:6, fontSize:13, flexShrink:0,
+              border:`1px solid ${activeFilterCount ? "#7FB8AD" : "#2A3438"}`,
+              background: activeFilterCount ? "rgba(127,184,173,0.12)" : "transparent",
+              color: activeFilterCount ? "#7FB8AD" : "#8A9AA0" }}>
+              絞込{activeFilterCount ? ` ${activeFilterCount}` : ""}{showFilters ? " ▲" : " ▼"}
+            </button>
+          )}
+        </div>
+
+        {(showFilters || !isMobile) && (
+          <div style={{ marginTop:10, display:"flex", flexDirection:"column", gap:10 }}>
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
+              <select value={genreFilter} onChange={e => setGenreFilter(e.target.value)} style={{ flex:"1 1 130px" }}>
+                <option value="">全ジャンル</option>
+                {genres.map(([g, c]) => <option key={g} value={g}>{g} ({c})</option>)}
+              </select>
+              <select value={keyFilter} onChange={e => setKeyFilter(e.target.value)} style={{ flex:"0 1 90px" }}>
+                <option value="">全キー</option>
+                {usedKeys.map(k => <option key={k} value={k}>{k}</option>)}
+              </select>
+              <select value={decadeFilter} onChange={e => setDecadeFilter(e.target.value)} style={{ flex:"0 1 110px" }}>
+                <option value="">全年代</option>
+                {decades.map(d => <option key={d} value={d}>{d}年代</option>)}
+              </select>
+              <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                <span style={S.label}>BPM</span>
+                <input type="text" inputMode="numeric" placeholder="min"
+                  value={bpmMin} onChange={e => setBpmMin(e.target.value.replace(/[^0-9.]/g, ""))}
+                  style={{ ...S.input, width:70, ...S.mono, textAlign:"center", padding:"7px 4px" }} />
+                <span style={{ color:"#5C6B70" }}>–</span>
+                <input type="text" inputMode="numeric" placeholder="max"
+                  value={bpmMax} onChange={e => setBpmMax(e.target.value.replace(/[^0-9.]/g, ""))}
+                  style={{ ...S.input, width:70, ...S.mono, textAlign:"center", padding:"7px 4px" }} />
+              </div>
+            </div>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {allTags.map(t => {
+                const on = activeTags.includes(t);
+                return (
+                  <button key={t}
+                    onClick={() => setActiveTags(p => on ? p.filter(x => x !== t) : [...p, t])}
+                    style={{ fontSize:12, padding:"5px 12px", borderRadius:20,
+                      border:`1px solid ${on ? "#7FB8AD" : "#2A3438"}`,
+                      background: on ? "rgba(127,184,173,0.12)" : "transparent",
+                      color: on ? "#7FB8AD" : "#8A9AA0" }}>{t}</button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ ...S.mono, fontSize:11, color:"#7A8B91", margin:"0 2px 6px" }}>
+        {filtered.length.toLocaleString()}曲{filtered.length !== lib.length ? ` / 全${lib.length.toLocaleString()}曲` : ""}
+      </div>
+
+      <div style={{ ...S.panel, overflow:"hidden" }}>
+        {shown.map(t => <TrackRow key={t.id} t={t} />)}
+        {filtered.length === 0 && (
+          <div style={{ padding:24, textAlign:"center", color:"#5C6B70", fontSize:13 }}>
+            条件に合う曲がありません。
+          </div>
+        )}
+        {filtered.length > RENDER_LIMIT && (
+          <div style={{ ...S.mono, padding:"10px 12px", fontSize:11, color:"#5C6B70",
+            borderTop:"1px solid #222B2F" }}>
+            {filtered.length.toLocaleString()}件中 先頭{RENDER_LIMIT}件を表示
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const NextView = (
+    <div style={{ ...S.panel, padding:14 }}>
+      {!selected && (
+        <div style={{ fontSize:13, color:"#5C6B70", padding:"14px 0" }}>
+          ライブラリから曲を選ぶと、キー互換 × BPM × エナジーで次曲候補を提案します。
+        </div>
+      )}
+      {selected && (
+        <>
+          <div style={{ marginBottom:12, paddingBottom:12, borderBottom:"1px solid #222B2F" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontWeight:700, fontSize:16 }}>{selected.title}</div>
+                <div style={{ fontSize:12, color:"#6E7E84" }}>
+                  {selected.artist}{selected.year ? <span style={{ ...S.mono, color:"#5C6B70" }}> · {selected.year}</span> : null}
+                </div>
+                {selected.label && (
+                  <div onClick={() => { setQ(selected.label); if (isMobile) setTab("lib"); }}
+                    style={{ fontSize:11, color:"#94A6C4", marginTop:3, cursor:"pointer",
+                      textDecoration:"underline", textDecorationColor:"rgba(148,166,196,0.4)" }}>
+                    {selected.label}
+                  </div>
+                )}
+                {selected.genre && (
+                  <div style={{ fontSize:10, color:"#5C6B70", marginTop:2 }}>{selected.genre}</div>
+                )}
+              </div>
+              <SpotifyBtn url={selected.url} size={34} />
+            </div>
+            <div style={{ display:"flex", gap:10, alignItems:"center", marginTop:8 }}>
+              <span style={{ ...S.mono, fontSize:13, color:"#B8C4C2" }}>{selected.bpm ?? "—"} BPM</span>
+              <KeyChip k={selected.key} />
+              <EnergyBars level={selected.energy} />
+            </div>
+            <SpotifyEmbed url={selected.url} />
+
+            <div style={{ ...S.label, margin:"12px 0 6px" }}>Tags</div>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {allTags.map(tag => {
+                const on = getTags(selected).includes(tag);
+                return (
+                  <button key={tag} onClick={() => toggleTrackTag(selected, tag)} style={{
+                    fontSize:12, padding:"5px 12px", borderRadius:20,
+                    border:`1px solid ${on ? "#E0A458" : "#2A3438"}`,
+                    background: on ? "rgba(224,164,88,0.12)" : "transparent",
+                    color: on ? "#E0A458" : "#6E7E84" }}>
+                    {on ? "✓ " : "+ "}{tag}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ display:"flex", gap:6, marginTop:8 }}>
+              <input value={newTag} onChange={e => setNewTag(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") addCustomTag(); }}
+                placeholder="新しいタグを作成"
+                style={{ ...S.input, flex:1, minWidth:0 }} />
+              <button onClick={addCustomTag} style={{
+                padding:"0 14px", borderRadius:6, fontSize:13, flexShrink:0,
+                border:"1px solid #2A3438", background:"transparent", color:"#8A9AA0" }}>追加</button>
+            </div>
+
+            <button onClick={() => { addToSet(selected); if (isMobile) setTab("set"); }} style={{
+              marginTop:12, width:"100%", padding:"11px 0", borderRadius:6,
+              border:"1px solid #7FB8AD", background:"rgba(127,184,173,0.12)",
+              color:"#7FB8AD", fontSize:14, fontWeight:500 }}>
+              セットに追加
+            </button>
+          </div>
+
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8 }}>
+            <div style={{ ...S.label, flex:1 }}>Next candidates</div>
+            <button onClick={() => setShuffleTick(x => x + 1)} style={{
+              border:"1px solid #2A3438", background:"transparent", color:"#8A9AA0",
+              borderRadius:5, padding:"4px 10px", fontSize:12 }}>
+              🔀 シャッフル
+            </button>
+          </div>
+          <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:10 }}>
+            {[["smooth","同系統"],["genre","同じジャンル"],["era","同年代"],["shift","雰囲気変える"],["bpm","BPM維持"],["energy","⚡上げる"],["down","↓下げる"]].map(([m, l]) => (
+              <button key={m} onClick={() => setSugMode(m)} style={{
+                fontSize:12, padding:"6px 12px", borderRadius:20,
+                border:`1px solid ${sugMode === m ? "#7FB8AD" : "#2A3438"}`,
+                background: sugMode === m ? "rgba(127,184,173,0.15)" : "transparent",
+                color: sugMode === m ? "#7FB8AD" : "#8A9AA0", fontWeight: sugMode === m ? 600 : 400 }}>
+                {l}
+              </button>
+            ))}
+          </div>
+          {(!selected.key || !selected.bpm) && (
+            <div style={{ fontSize:12, color:"#5C6B70" }}>
+              この曲はキーまたはBPM情報がないため、候補を計算できません。
+            </div>
+          )}
+          {selected.key && selected.bpm && suggestions.length === 0 && (
+            <div style={{ fontSize:12, color:"#5C6B70", lineHeight:1.6 }}>
+              このモードの条件に合う曲が見つかりません(候補はBPM±5以内が対象です)。
+              {sugMode === "genre" && "(選択中の曲とジャンルが1つ以上重なる曲を探しています。ジャンル情報のないライブラリでは使えません)"}
+              {sugMode === "era" && "(選択中の曲と同じ年代の曲を探しています。年情報のないライブラリでは使えません)"}
+              {sugMode === "shift" && "(ジャンル情報がある曲同士でジャンルが被らないものを探しています)"}
+              {sugMode === "energy" && "(エナジーが今の曲より高く、キー・BPMがつながる曲を探しています)"}
+              {sugMode === "down" && "(エナジーが今の曲より低く、キー・BPMがつながる曲を探しています)"}
+              別のモードやシャッフルを試してください。
+            </div>
+          )}
+          {suggestions.map(({ t, kr, br, eDelta }) => (
+            <div key={t.id} onClick={() => setSelected(t)} style={{
+              display:"flex", alignItems:"center", gap:10,
+              padding:"9px 0", borderBottom:"1px solid #1A2226", cursor:"pointer" }}>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", gap:8 }}>
+                  <span style={{ fontSize:14, fontWeight:500, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{t.title}</span>
+                  <span style={{ ...S.mono, fontSize:12, color:"#B8C4C2", flexShrink:0 }}>{t.bpm}</span>
+                </div>
+                <div style={{ fontSize:11, color:"#6E7E84" }}>{t.artist}</div>
+                <div style={{ display:"flex", gap:8, alignItems:"center", marginTop:3, flexWrap:"wrap" }}>
+                  <KeyChip k={t.key} />
+                  <span style={{ fontSize:10, color:"#7FB8AD" }}>{kr.label}</span>
+                  <span style={{ ...S.mono, fontSize:10, color:"#7A8B91" }}>Δ{(br.pct*100).toFixed(1)}%</span>
+                  {eDelta !== 0 && (
+                    <span style={{ fontSize:10, color: eDelta > 0 ? "#E0A458" : "#94A6C4" }}>
+                      {eDelta > 0 ? "↑" : "↓"} energy
+                    </span>
+                  )}
+                </div>
+              </div>
+              <SpotifyBtn url={t.url} />
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+
+  const SetView = (
+    <div style={{ ...S.panel, padding:14 }}>
+      <div style={{ ...S.label, marginBottom:10 }}>Set builder — {setList.length} tracks</div>
+      {setList.length === 0 && (
+        <div style={{ fontSize:12, color:"#5C6B70" }}>空のセットです。曲を選んで「セットに追加」してください。</div>
+      )}
+      {setList.map((t, i) => (
+        <div key={t.id}>
+          {i > 0 && (() => {
+            const tr = transition(setList[i-1], t);
+            return (
+              <div style={{ ...S.mono, fontSize:10, color:tr.c, padding:"3px 0 3px 14px" }}>
+                │ {tr.txt}
+              </div>
+            );
+          })()}
+          <div style={{ display:"flex", alignItems:"center", gap:6, padding:"7px 0" }}>
+            <span style={{ ...S.mono, fontSize:10, color:"#5C6B70", width:18, flexShrink:0 }}>{String(i+1).padStart(2,"0")}</span>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:14, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{t.title}</div>
+              <span style={{ ...S.mono, fontSize:10, color:"#7A8B91" }}>
+                {t.bpm ?? "—"} · {t.key ?? "—"}
+              </span>
+            </div>
+            <SpotifyBtn url={t.url} size={24} />
+            <button onClick={() => moveInSet(i, -1)} disabled={i === 0} style={{
+              border:"none", background:"transparent", padding:"6px 4px", fontSize:14,
+              color: i === 0 ? "#2A3438" : "#8A9AA0" }}>↑</button>
+            <button onClick={() => moveInSet(i, 1)} disabled={i === setList.length - 1} style={{
+              border:"none", background:"transparent", padding:"6px 4px", fontSize:14,
+              color: i === setList.length - 1 ? "#2A3438" : "#8A9AA0" }}>↓</button>
+            <button onClick={() => removeFromSet(t.id)} style={{
+              border:"none", background:"transparent", color:"#5C6B70", fontSize:16, padding:"6px 4px" }}>×</button>
+          </div>
+        </div>
+      ))}
+
+      {setList.length > 0 && (
+        <div style={{ marginTop:14, paddingTop:14, borderTop:"1px solid #222B2F" }}>
+          <div style={{ ...S.label, marginBottom:8 }}>Export</div>
+          <input value={playlistName} onChange={e => setPlaylistName(e.target.value)}
+            placeholder={`四辻 set ${new Date().toISOString().slice(0, 10)}`}
+            style={{ ...S.input, width:"100%", marginBottom:8 }} />
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+            <button onClick={copyForImport} style={{
+              flex:"1 1 100%", padding:"11px 0", borderRadius:6, fontSize:13, fontWeight:500,
+              border:"1px solid rgba(30,215,96,0.5)", background:"rgba(30,215,96,0.12)", color:"#1ED760" }}>
+              曲名リストをコピー(TuneMyMusic用)
+            </button>
+            <button onClick={copyTrackLinks} style={{
+              flex:1, padding:"10px 0", borderRadius:6, fontSize:13,
+              border:"1px solid #2A3438", background:"transparent", color:"#8A9AA0" }}>
+              URLコピー
+            </button>
+            <button onClick={copyUris} style={{
+              padding:"10px 14px", borderRadius:6, fontSize:13, flexShrink:0,
+              border:"1px solid #2A3438", background:"transparent", color:"#8A9AA0" }}>
+              URIコピー(PC用)
+            </button>
+          </div>
+          <div style={{ marginTop:8, fontSize:11, color:"#5C6B70", lineHeight:1.7 }}>
+            手順: ①上の緑ボタンでコピー ② Safariで tunemymusic.com を開く ③「転送をスタート」→ 転送元で「テキストから」を選択 ④ 貼り付けて確認(1行1曲になっているか)⑤ 転送先にSpotifyを選んでログイン → 完了。曲順はそのまま反映されます。
+          </div>
+          {exportState && exportState !== "loading" && (
+            <div style={{ marginTop:8, fontSize:12, lineHeight:1.5,
+              color: exportState.ok ? "#7FB8AD" : "#C4675C" }}>
+              {exportState.msg}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0D1113", color:"#DCE4E2",
+      fontFamily:"'Space Grotesk', sans-serif",
+      padding: isMobile ? "14px 10px 80px" : "20px 16px" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        ::placeholder{color:#4A585D}
+        button{cursor:pointer;font-family:inherit}
+        select{background:#0D1113;border:1px solid #2A3438;border-radius:6px;padding:9px 8px;color:#DCE4E2;font-size:16px;font-family:inherit;min-width:0}
+        *{box-sizing:border-box}
+        body{overflow-x:hidden}
+      `}</style>
+
+      <header style={{ display:"flex", alignItems:"center", gap:10, marginBottom:14, flexWrap:"wrap" }}>
+        <h1 style={{ margin:0, fontSize: isMobile ? 20 : 26, fontWeight:700, letterSpacing:1 }}>
+          四辻 <span style={{ color:"#7FB8AD" }}>TRACK DECK</span>
+        </h1>
+        <span style={{ ...S.mono, fontSize:10, color:"#5C6B70" }}>
+          {lib.length.toLocaleString()} tr · v1.0
+        </span>
+        <div style={{ marginLeft:"auto", display:"flex", gap:6, flexWrap:"wrap" }}>
+          <button onClick={() => fileRef.current?.click()} style={{
+            padding:"6px 12px", borderRadius:5, fontSize:12, fontWeight:500,
+            border:"1px solid #7FB8AD", background:"rgba(127,184,173,0.12)", color:"#7FB8AD" }}>
+            CSV
+          </button>
+          <button onClick={exportTags} disabled={taggedCount === 0} style={{
+            padding:"6px 12px", borderRadius:5, fontSize:12,
+            border:"1px solid #2A3438", background:"transparent",
+            color: taggedCount ? "#8A9AA0" : "#4A585D" }}>
+            タグ保存{taggedCount ? `(${taggedCount})` : ""}
+          </button>
+          <button onClick={() => tagFileRef.current?.click()} style={{
+            padding:"6px 12px", borderRadius:5, fontSize:12,
+            border:"1px solid #2A3438", background:"transparent", color:"#8A9AA0" }}>
+            タグ復元
+          </button>
+          <button onClick={resetAll} style={{
+            padding:"6px 10px", borderRadius:5, fontSize:12,
+            border:"1px solid #2A3438", background:"transparent", color:"#5C6B70" }}>
+            初期化
+          </button>
+        </div>
+        <input ref={fileRef} type="file" accept=".csv" style={{ display:"none" }}
+          onChange={e => { if (e.target.files?.[0]) onFile(e.target.files[0]); e.target.value = ""; }} />
+        <input ref={tagFileRef} type="file" accept=".json" style={{ display:"none" }}
+          onChange={e => { if (e.target.files?.[0]) importTags(e.target.files[0]); e.target.value = ""; }} />
+      </header>
+
+      {importStats && !importStats.error && (
+        <div style={{ ...S.panel, padding:"9px 12px", marginBottom:12, fontSize:12, color:"#8A9AA0",
+          display:"flex", gap:12, flexWrap:"wrap" }}>
+          <span style={{ color:"#7FB8AD" }}>✓ {importStats.total.toLocaleString()}曲</span>
+          {importStats.noKey > 0 && <span>キーなし {importStats.noKey.toLocaleString()}</span>}
+          {importStats.noBpm > 0 && <span>BPMなし {importStats.noBpm.toLocaleString()}</span>}
+        </div>
+      )}
+      {importStats?.error && (
+        <div style={{ ...S.panel, padding:"9px 12px", marginBottom:12, fontSize:12, color:"#C4675C" }}>
+          {importStats.error}
+        </div>
+      )}
+
+      {mappingState && (
+        <div style={{ ...S.panel, padding:14, marginBottom:14, border:"1px solid #7FB8AD" }}>
+          <div style={{ ...S.label, marginBottom:4 }}>Column mapping</div>
+          <div style={{ fontSize:12, color:"#8A9AA0", marginBottom:12 }}>
+            カラムを自動検出しました({mappingState.rows.length.toLocaleString()}行)。
+          </div>
+          <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:14 }}>
+            {[["title","曲名 *"],["artist","アーティスト"],["bpm","BPM"],["key","キー"],["mode","Mode"],["energy","Energy"],["genre","ジャンル"],["label","レーベル"],["year","年(リリース日)"],["url","Spotifyリンク"]].map(([f, jp]) => (
+              <label key={f} style={{ display:"flex", flexDirection:"column", gap:4, flex:"1 1 140px" }}>
+                <span style={{ ...S.label, letterSpacing:1 }}>{jp}</span>
+                <select value={mappingState.map[f]}
+                  onChange={e => setMappingState(m => ({ ...m, map: { ...m.map, [f]: e.target.value } }))}>
+                  <option value="">— なし —</option>
+                  {mappingState.headers.map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
+          <div style={{ display:"flex", gap:10 }}>
+            <button onClick={runImport} disabled={!mappingState.map.title} style={{
+              padding:"10px 20px", borderRadius:6, fontSize:14, fontWeight:500,
+              border:"none", background: mappingState.map.title ? "#7FB8AD" : "#2A3438",
+              color: mappingState.map.title ? "#0D1113" : "#5C6B70" }}>
+              インポート
+            </button>
+            <button onClick={() => setMappingState(null)} style={{
+              padding:"10px 16px", borderRadius:6, fontSize:14,
+              border:"1px solid #2A3438", background:"transparent", color:"#8A9AA0" }}>
+              キャンセル
+            </button>
+          </div>
+        </div>
+      )}
+
+      {isMobile ? (
+        <>
+          {tab === "lib" && LibraryView}
+          {tab === "next" && NextView}
+          {tab === "set" && SetView}
+
+          {/* Bottom tab bar */}
+          <nav style={{
+            position:"fixed", bottom:0, left:0, right:0, zIndex:10,
+            display:"flex", background:"#10161A", borderTop:"1px solid #222B2F",
+            paddingBottom:"env(safe-area-inset-bottom)" }}>
+            {[["lib","ライブラリ"],["next","次曲"],["set",`セット${setList.length ? ` (${setList.length})` : ""}`]].map(([k, l]) => (
+              <button key={k} onClick={() => setTab(k)} style={{
+                flex:1, padding:"13px 0", border:"none", fontSize:13, fontWeight:500,
+                background:"transparent",
+                color: tab === k ? "#7FB8AD" : "#5C6B70",
+                borderTop: tab === k ? "2px solid #7FB8AD" : "2px solid transparent" }}>
+                {l}
+              </button>
+            ))}
+          </nav>
+        </>
+      ) : (
+        <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
+          <div style={{ flex:"2 1 460px", minWidth:320 }}>{LibraryView}</div>
+          <div style={{ flex:"1 1 300px", minWidth:280, display:"flex", flexDirection:"column", gap:12 }}>
+            {NextView}
+            {SetView}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<TrackDeck />);
+</script>
+</body>
+</html>
