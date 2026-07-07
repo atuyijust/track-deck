@@ -12,7 +12,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2220%22 fill=%22%230D1113%22/><text y=%2270%22 x=%2250%22 text-anchor=%22middle%22 font-size=%2255%22 fill=%22%237FB8AD%22 font-family=%22monospace%22>四</text></svg>">
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
 <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
 <style>html,body{margin:0;padding:0;background:#0D1113;-webkit-text-size-adjust:100%}</style>
 </head>
@@ -33,6 +33,7 @@ window.addEventListener("error", function(e) {
 }, true);
 </script>
 <script type="text/babel" data-presets="react">
+/* @jsxRuntime classic @jsx React.createElement @jsxFrag React.Fragment */
 const { useState, useMemo, useRef, useEffect } = React;
 
 // ---- Camelot key logic ----
