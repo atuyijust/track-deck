@@ -21,9 +21,9 @@
   <div id="boot" style="font-family:sans-serif;color:#7FB8AD;padding:40px 20px;font-size:14px;line-height:1.8">
     読み込み中…<br>
     <span style="color:#5C6B70;font-size:12px">この表示のまま変わらない場合は通信環境を確認してリロードしてください。エラーがあれば下に表示されます。</span>
-    <div id="errbox" style="color:#C4675C;font-size:12px;margin-top:16px;word-break:break-all"></div>
   </div>
 </div>
+<div id="errbox" style="position:fixed;bottom:0;left:0;right:0;color:#C4675C;background:rgba(13,17,19,0.95);font-family:sans-serif;font-size:12px;padding:0 12px;word-break:break-all;z-index:9999"></div>
 <script>
 window.addEventListener("error", function(e) {
   var box = document.getElementById("errbox");
@@ -247,6 +247,10 @@ function TrackDeck() {
     return () => mq.removeEventListener("change", upd);
   }, []);
 
+  const [tagMap, setTagMap] = useState(() => { try { return JSON.parse(localStorage.getItem("td_tags") || "{}"); } catch { return {}; } });
+  const [customTags, setCustomTags] = useState(() => { try { return JSON.parse(localStorage.getItem("td_ctags") || "[]"); } catch { return []; } });
+  const [newTag, setNewTag] = useState("");
+
   // ---- localStorage persistence ----
   useEffect(() => { try { localStorage.setItem("td_tags", JSON.stringify(tagMap)); } catch {} }, [tagMap]);
   useEffect(() => { try { localStorage.setItem("td_ctags", JSON.stringify(customTags)); } catch {} }, [customTags]);
@@ -265,10 +269,6 @@ function TrackDeck() {
       location.reload();
     }
   };
-
-  const [tagMap, setTagMap] = useState(() => { try { return JSON.parse(localStorage.getItem("td_tags") || "{}"); } catch { return {}; } });
-  const [customTags, setCustomTags] = useState(() => { try { return JSON.parse(localStorage.getItem("td_ctags") || "[]"); } catch { return []; } });
-  const [newTag, setNewTag] = useState("");
 
   const getTags = (t) => tagMap[trackKey(t)] || [];
   const allTags = useMemo(() => {
